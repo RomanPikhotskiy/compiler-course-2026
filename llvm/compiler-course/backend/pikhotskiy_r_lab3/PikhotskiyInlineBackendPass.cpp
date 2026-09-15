@@ -1,5 +1,6 @@
 #include "X86.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
@@ -65,6 +66,8 @@ MachineInstr *cloneForCaller(MachineFunction &CallerMF, const MachineInstr &Src,
     if (!Mapped) {
       const TargetRegisterClass *RC = CalleeMRI.getRegClass(R);
       Mapped = CallerMRI.createVirtualRegister(RC);
+      CallerMF.getProperties().reset(
+          MachineFunctionProperties::Property::NoVRegs);
     }
     MO.setReg(Mapped);
   }
@@ -83,15 +86,19 @@ bool inlineAtCallsite(MachineFunction &CallerMF, MachineInstr &CallMI,
 
   MachineBasicBlock::iterator InsertPos = CallMI.getIterator();
   const MachineBasicBlock &CalleeEntry = CalleeMF.front();
+  SmallVector<MachineInstr *, 16> Clones;
   for (const MachineInstr &MI : CalleeEntry) {
     if (MI.isDebugInstr() || MI.isCFIInstruction())
       continue;
     if (MI.isTerminator())
       continue;
 
-    MachineInstr *Clone = cloneForCaller(CallerMF, MI, CalleeMRI, VRegMap);
-    CallBB->insert(InsertPos, Clone);
+    Clones.push_back(cloneForCaller(CallerMF, MI, CalleeMRI, VRegMap));
   }
+
+  // For a self-call, finish reading the original body before inserting clones.
+  for (MachineInstr *Clone : Clones)
+    CallBB->insert(InsertPos, Clone);
 
   CallMI.eraseFromParent();
   return true;

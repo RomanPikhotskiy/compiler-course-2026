@@ -1,12 +1,20 @@
-# RUN: llc -mtriple x86_64-unknown-linux-gnu --load=%llvmshlibdir/pikhotskiy_r_lab3_BACKEND%shlibext -run-pass=pikhotskiy-inline-backend %s -o - | FileCheck %s
+# RUN: llc -mtriple x86_64-unknown-linux-gnu --load=%llvmshlibdir/pikhotskiy_r_lab3_BACKEND%shlibext -run-pass=pikhotskiy-inline-backend -verify-machineinstrs %s -o - | FileCheck %s
+
+# Keep callers before callees in IR: llc frees each MachineFunction after
+# running the pass pipeline on it. Both rejection tests must see a live callee.
 
 --- |
+  define void @caller_keeps_large_call() {
+    call void @oversized_callee()
+    ret void
+  }
+
   define void @oversized_callee() {
     ret void
   }
 
-  define void @caller_keeps_large_call() {
-    call void @oversized_callee()
+  define void @caller_keeps_multiblock_call() {
+    call void @split_callee()
     ret void
   }
 
@@ -14,11 +22,6 @@
     br label %next
 
   next:
-    ret void
-  }
-
-  define void @caller_keeps_multiblock_call() {
-    call void @split_callee()
     ret void
   }
 
