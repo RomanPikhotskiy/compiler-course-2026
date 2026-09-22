@@ -1,8 +1,9 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Tools/Plugins/PassPlugin.h"
-#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/DenseMap.h"
 
 using namespace mlir;
 
@@ -20,26 +21,26 @@ public:
     ModuleOp module = getOperation();
     Builder builder(&getContext());
 
-    llvm::StringMap<int64_t> incomingCalls;
-    for (func::FuncOp function : module.getOps<func::FuncOp>())
-      incomingCalls[function.getSymName()] = 0;
+    llvm::DenseMap<Operation *, int64_t> incomingCalls;
+    module.walk([&](func::FuncOp function) { incomingCalls[function] = 0; });
 
-    for (func::FuncOp caller : module.getOps<func::FuncOp>()) {
-      StringRef callerName = caller.getSymName();
-      caller.walk([&](func::CallOp callOp) {
-        StringRef calleeName = callOp.getCallee();
-        if (calleeName == callerName)
-          return;
-        auto it = incomingCalls.find(calleeName);
-        if (it != incomingCalls.end())
-          ++it->second;
-      });
-    }
+    SymbolTableCollection symbols;
+    module.walk([&](func::CallOp callOp) {
+      auto caller = callOp->getParentOfType<func::FuncOp>();
+      // Resolve the symbol in its own scope, not just by its printed name.
+      auto callee = symbols.lookupNearestSymbolFrom<func::FuncOp>(
+          callOp, callOp.getCalleeAttr());
+      if (!caller || !callee || caller == callee)
+        return;
+      auto it = incomingCalls.find(callee);
+      if (it != incomingCalls.end())
+        ++it->second;
+    });
 
-    for (func::FuncOp function : module.getOps<func::FuncOp>()) {
-      int64_t count = incomingCalls.lookup(function.getSymName());
+    module.walk([&](func::FuncOp function) {
+      int64_t count = incomingCalls.lookup(function);
       function->setAttr("call_count", builder.getI64IntegerAttr(count));
-    }
+    });
   }
 };
 } // namespace
