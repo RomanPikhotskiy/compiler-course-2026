@@ -1,9 +1,11 @@
 # RUN: llc -mtriple x86_64-unknown-linux-gnu --load=%llvmshlibdir/pikhotskiy_r_lab3_BACKEND%shlibext -run-pass=pikhotskiy-inline-backend -verify-machineinstrs %s -o - | FileCheck %s
 
-# Keep callers before callees in IR: llc frees each MachineFunction after
-# running its pass pipeline. This keeps callee bodies available for all tests.
+# Exercise both definition orders; original callee bodies must stay available
+# throughout the module pass, including when a callee has already been inlined.
 
 --- |
+  @shared_value = global i32 0
+
   define void @caller_keeps_large_call() {
     call void @oversized_callee()
     ret void
@@ -45,6 +47,19 @@
   define void @register_call() { ret void }
   define void @mixed_calls() { ret void }
   define void @local_marker() { ret void }
+  define void @early_leaf() { ret void }
+  define void @late_caller() { ret void }
+  define void @stack_caller() { ret void }
+  define void @stack_callee() { ret void }
+  define void @loop_caller() { ret void }
+  define void @loop_callee() { ret void }
+  define void @tail_caller() { ret void }
+  define void @tail_callee() { ret void }
+  define void @recursive_twice() { ret void }
+  define void @cycle_left() { ret void }
+  define void @cycle_right() { ret void }
+  define void @write_global() { ret void }
+  define void @read_after_call() { ret void }
   declare void @runtime_hook()
 ...
 
@@ -141,7 +156,7 @@ name: nested_calls
 tracksRegLiveness: true
 body: |
   bb.0:
-    ; The call introduced by inlining outer_step is handled in another round.
+    ; Expand the nested call from the original outer_step body.
     ; CHECK-LABEL: name: nested_calls
     ; CHECK: bb.0:
     ; CHECK-NEXT: %[[OUTER:[0-9]+]]:gr32 = MOV32ri 74
@@ -334,7 +349,7 @@ body: |
     RET64
 ...
 
-# Bound self-recursive expansion to three rounds.
+# Three recursive edges add three copies of the original marker, not seven.
 ---
 name: bounded_recursion
 tracksRegLiveness: true
@@ -342,10 +357,6 @@ body: |
   bb.0:
     ; CHECK-LABEL: name: bounded_recursion
     ; CHECK: bb.0:
-    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
-    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
-    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
-    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
     ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
     ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
     ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
@@ -419,5 +430,198 @@ tracksRegLiveness: true
 body: |
   bb.0:
     %0:gr32 = MOV32ri 86
+    RET64
+...
+
+# A previously processed callee must still inline using its original body.
+---
+name: early_leaf
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:gr32 = MOV32ri 123
+    RET64
+...
+---
+name: late_caller
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: late_caller
+    ; CHECK: bb.0:
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 123
+    ; CHECK-NEXT: RET64
+    ; CHECK-NEXT: {{^\.\.\.$}}
+    CALL64pcrel32 @early_leaf
+    RET64
+...
+
+# Frame indices belong to the callee. Preserve calls requiring frame remapping.
+---
+name: stack_caller
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: stack_caller
+    ; CHECK: bb.0:
+    ; CHECK-NEXT: CALL64pcrel32 @stack_callee
+    ; CHECK-NEXT: RET64
+    ; CHECK-NEXT: {{^\.\.\.$}}
+    CALL64pcrel32 @stack_callee
+    RET64
+...
+---
+name: stack_callee
+tracksRegLiveness: true
+stack:
+  - { id: 0, type: default, size: 4, alignment: 4 }
+body: |
+  bb.0:
+    MOV32mi %stack.0, 1, $noreg, 0, $noreg, 23 :: (store (s32) into %stack.0)
+    RET64
+...
+
+# Even a one-block callee can have a loop instead of a return.
+---
+name: loop_caller
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: loop_caller
+    ; CHECK: bb.0:
+    ; CHECK-NEXT: CALL64pcrel32 @loop_callee
+    ; CHECK-NEXT: RET64
+    ; CHECK-NEXT: {{^\.\.\.$}}
+    CALL64pcrel32 @loop_callee
+    RET64
+...
+---
+name: loop_callee
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.0
+    JMP_1 %bb.0
+...
+
+# A tail call is a control-flow terminator, not an ordinary call or return.
+---
+name: tail_caller
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: tail_caller
+    ; CHECK: bb.0:
+    ; CHECK-NEXT: CALL64pcrel32 @tail_callee
+    ; CHECK-NEXT: RET64
+    ; CHECK-NEXT: {{^\.\.\.$}}
+    CALL64pcrel32 @tail_callee
+    RET64
+...
+---
+name: tail_callee
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: tail_callee
+    ; CHECK: bb.0:
+    ; CHECK-NEXT: TCRETURNdi64 @return_only, 0
+    ; CHECK-NEXT: {{^\.\.\.$}}
+    TCRETURNdi64 @return_only, 0, csr_64, implicit $rsp, implicit $ssp
+...
+
+# Each call gets its own recursion budget, even after bounded_recursion ran.
+---
+name: recursive_twice
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: recursive_twice
+    ; CHECK: bb.0:
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
+    ; CHECK-NEXT: CALL64pcrel32 @bounded_recursion
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 39
+    ; CHECK-NEXT: CALL64pcrel32 @bounded_recursion
+    ; CHECK-NEXT: RET64
+    ; CHECK-NEXT: {{^\.\.\.$}}
+    CALL64pcrel32 @bounded_recursion
+    CALL64pcrel32 @bounded_recursion
+    RET64
+...
+
+# Count repeated functions along each call path, including mutual recursion.
+---
+name: cycle_left
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: cycle_left
+    ; CHECK: bb.0:
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 41
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 73
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 41
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 73
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 41
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 73
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 41
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 73
+    ; CHECK-NEXT: CALL64pcrel32 @cycle_left
+    ; CHECK-NEXT: RET64
+    ; CHECK-NEXT: {{^\.\.\.$}}
+    %0:gr32 = MOV32ri 41
+    CALL64pcrel32 @cycle_right
+    RET64
+...
+---
+name: cycle_right
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: cycle_right
+    ; CHECK: bb.0:
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 73
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 41
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 73
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 41
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 73
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 41
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 73
+    ; CHECK-NEXT: %{{[0-9]+}}:gr32 = MOV32ri 41
+    ; CHECK-NEXT: CALL64pcrel32 @cycle_right
+    ; CHECK-NEXT: RET64
+    ; CHECK-NEXT: {{^\.\.\.$}}
+    %0:gr32 = MOV32ri 73
+    CALL64pcrel32 @cycle_left
+    RET64
+...
+
+# Memory descriptors in the clone must outlive the original callee's body.
+---
+name: write_global
+tracksRegLiveness: true
+body: |
+  bb.0:
+    MOV32mi $rip, 1, $noreg, @shared_value, $noreg, 57 :: (store (s32) into @shared_value)
+    RET64
+...
+---
+name: read_after_call
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: read_after_call
+    ; CHECK: bb.0:
+    ; CHECK-NEXT: MOV32mi $rip, 1, $noreg, @shared_value, $noreg, 57 :: (store (s32) into @shared_value)
+    ; CHECK-NEXT: %0:gr32 = MOV32rm $rip, 1, $noreg, @shared_value, $noreg :: (load (s32) from @shared_value)
+    ; CHECK-NEXT: RET64
+    ; CHECK-NEXT: {{^\.\.\.$}}
+    CALL64pcrel32 @write_global
+    %0:gr32 = MOV32rm $rip, 1, $noreg, @shared_value, $noreg :: (load (s32) from @shared_value)
     RET64
 ...

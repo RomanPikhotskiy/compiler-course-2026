@@ -1,12 +1,16 @@
 #include "X86.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
+#include <algorithm>
 
 using namespace llvm;
 
@@ -14,7 +18,12 @@ namespace {
 
 constexpr unsigned kMaxInlineInstrCount = 15;
 constexpr unsigned kMaxSelfInlineDepth = 3;
-constexpr unsigned kMaxRounds = 64;
+constexpr unsigned kMaxCallChain = 64;
+
+struct InlineBody {
+  MachineFunction *MF = nullptr;
+  SmallVector<MachineInstr *, 16> Instructions;
+};
 
 const Function *extractDirectCallee(const MachineInstr &MI) {
   for (const MachineOperand &MO : MI.operands()) {
@@ -46,6 +55,34 @@ bool canInlineCallee(const MachineFunction &MF) {
     return false;
   if (std::next(MF.begin()) != MF.end())
     return false;
+
+  const MachineFrameInfo &Frame = MF.getFrameInfo();
+  if (Frame.getNumObjects() || Frame.hasVarSizedObjects() ||
+      Frame.getStackSize())
+    return false;
+
+  const MachineBasicBlock &Entry = MF.front();
+  if (Entry.empty() || Entry.isEHPad() || !Entry.back().isReturn() ||
+      Entry.back().isCall())
+    return false;
+
+  for (const MachineInstr &MI : Entry) {
+    if (MI.isDebugInstr() || MI.isCFIInstruction())
+      continue;
+    if (MI.isTerminator() && &MI != &Entry.back())
+      return false;
+    if (MI.getFlag(MachineInstr::FrameSetup) ||
+        MI.getFlag(MachineInstr::FrameDestroy))
+      return false;
+    for (const MachineOperand &MO : MI.operands()) {
+      // These operands refer to data owned by the callee, not by the caller.
+      if (MO.isFI() || MO.isCPI() || MO.isJTI() || MO.isMBB() ||
+          MO.isBlockAddress() || MO.isTargetIndex())
+        return false;
+      if (MI.isReturn() && MO.isImm() && MO.getImm() != 0)
+        return false;
+    }
+  }
   return countBodyInstructions(MF) <= kMaxInlineInstrCount;
 }
 
@@ -53,6 +90,11 @@ MachineInstr *cloneForCaller(MachineFunction &CallerMF, const MachineInstr &Src,
                              const MachineRegisterInfo &CalleeMRI,
                              DenseMap<Register, Register> &VRegMap) {
   MachineInstr *Clone = CallerMF.CloneMachineInstr(&Src);
+  SmallVector<MachineMemOperand *, 2> MemoryOperands;
+  for (const MachineMemOperand *MMO : Src.memoperands())
+    MemoryOperands.push_back(CallerMF.getMachineMemOperand(
+        MMO, MMO->getPointerInfo(), MMO->getSize()));
+  Clone->setMemRefs(CallerMF, MemoryOperands);
   MachineRegisterInfo &CallerMRI = CallerMF.getRegInfo();
 
   for (MachineOperand &MO : Clone->operands()) {
@@ -76,90 +118,93 @@ MachineInstr *cloneForCaller(MachineFunction &CallerMF, const MachineInstr &Src,
 }
 
 bool inlineAtCallsite(MachineFunction &CallerMF, MachineInstr &CallMI,
-                      const MachineFunction &CalleeMF) {
+                      const DenseMap<const Function *, InlineBody> &Bodies,
+                      SmallVectorImpl<const Function *> &CallPath) {
+  if (!CallMI.isCall() || CallMI.isTerminator() ||
+      CallPath.size() >= kMaxCallChain)
+    return false;
+  const Function *CalleeF = extractDirectCallee(CallMI);
+  auto BodyIt = Bodies.find(CalleeF);
+  if (BodyIt == Bodies.end())
+    return false;
+  // The root function is already in the path. Allow three recursive edges.
+  if (std::count(CallPath.begin(), CallPath.end(), CalleeF) >
+      kMaxSelfInlineDepth)
+    return false;
+
   MachineBasicBlock *CallBB = CallMI.getParent();
   if (!CallBB)
     return false;
 
   DenseMap<Register, Register> VRegMap;
-  const MachineRegisterInfo &CalleeMRI = CalleeMF.getRegInfo();
+  const InlineBody &Body = BodyIt->second;
+  const MachineRegisterInfo &CalleeMRI = Body.MF->getRegInfo();
 
   MachineBasicBlock::iterator InsertPos = CallMI.getIterator();
-  const MachineBasicBlock &CalleeEntry = CalleeMF.front();
   SmallVector<MachineInstr *, 16> Clones;
-  for (const MachineInstr &MI : CalleeEntry) {
-    if (MI.isDebugInstr() || MI.isCFIInstruction())
-      continue;
-    if (MI.isTerminator())
-      continue;
+  for (const MachineInstr *MI : Body.Instructions)
+    Clones.push_back(cloneForCaller(CallerMF, *MI, CalleeMRI, VRegMap));
 
-    Clones.push_back(cloneForCaller(CallerMF, MI, CalleeMRI, VRegMap));
-  }
-
-  // For a self-call, finish reading the original body before inserting clones.
   for (MachineInstr *Clone : Clones)
     CallBB->insert(InsertPos, Clone);
 
   CallMI.eraseFromParent();
+  CallPath.push_back(CalleeF);
+  for (MachineInstr *Clone : Clones)
+    inlineAtCallsite(CallerMF, *Clone, Bodies, CallPath);
+  CallPath.pop_back();
   return true;
 }
 
-class PikhotskiyInlineBackendPass : public MachineFunctionPass {
+class PikhotskiyInlineBackendPass : public ModulePass {
 public:
   static char ID;
 
-  PikhotskiyInlineBackendPass() : MachineFunctionPass(ID) {}
+  PikhotskiyInlineBackendPass() : ModulePass(ID) {}
 
-  bool runOnMachineFunction(MachineFunction &MF) override {
+  bool runOnModule(Module &M) override {
     MachineModuleInfo &MMI =
         getAnalysis<MachineModuleInfoWrapperPass>().getMMI();
 
-    bool Changed = false;
-    unsigned SelfInlineDepth = 0;
-
-    for (unsigned Round = 0; Round < kMaxRounds; ++Round) {
-      bool RoundChanged = false;
-      bool InlinedSelf = false;
-
-      for (MachineBasicBlock &MBB : MF) {
-        for (auto It = MBB.begin(); It != MBB.end();) {
-          MachineInstr &MI = *It++;
-          if (!MI.isCall())
-            continue;
-
-          const Function *CalleeF = extractDirectCallee(MI);
-          if (!CalleeF)
-            continue;
-
-          MachineFunction *CalleeMF = MMI.getMachineFunction(*CalleeF);
-          if (!CalleeMF || !canInlineCallee(*CalleeMF))
-            continue;
-
-          const bool IsSelfCall = (CalleeF == &MF.getFunction());
-          if (IsSelfCall && SelfInlineDepth >= kMaxSelfInlineDepth)
-            continue;
-
-          if (!inlineAtCallsite(MF, MI, *CalleeMF))
-            continue;
-
-          Changed = true;
-          RoundChanged = true;
-          InlinedSelf |= IsSelfCall;
-        }
+    // Snapshot all eligible bodies before modifying any of them. The module
+    // pass also runs before llc frees individual MachineFunctions.
+    DenseMap<const Function *, InlineBody> Bodies;
+    for (Function &F : M) {
+      MachineFunction *MF = MMI.getMachineFunction(F);
+      if (!MF || !canInlineCallee(*MF))
+        continue;
+      InlineBody &Body = Bodies[&F];
+      Body.MF = MF;
+      for (const MachineInstr &MI : MF->front()) {
+        if (!MI.isDebugInstr() && !MI.isCFIInstruction() && !MI.isTerminator())
+          Body.Instructions.push_back(MF->CloneMachineInstr(&MI));
       }
-
-      if (InlinedSelf)
-        ++SelfInlineDepth;
-      if (!RoundChanged)
-        break;
     }
 
+    bool Changed = false;
+    for (Function &F : M) {
+      MachineFunction *MF = MMI.getMachineFunction(F);
+      if (!MF)
+        continue;
+      SmallVector<const Function *, 8> CallPath{&F};
+      for (MachineBasicBlock &MBB : *MF) {
+        for (auto It = MBB.begin(); It != MBB.end();) {
+          MachineInstr &MI = *It++;
+          Changed |= inlineAtCallsite(*MF, MI, Bodies, CallPath);
+        }
+      }
+    }
+
+    for (auto &Entry : Bodies)
+      for (MachineInstr *MI : Entry.second.Instructions)
+        Entry.second.MF->deleteMachineInstr(MI);
     return Changed;
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<MachineModuleInfoWrapperPass>();
-    MachineFunctionPass::getAnalysisUsage(AU);
+    AU.addPreserved<MachineModuleInfoWrapperPass>();
+    ModulePass::getAnalysisUsage(AU);
   }
 };
 
